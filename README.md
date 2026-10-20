@@ -1,12 +1,12 @@
 # Realtime order updates inside a support chat
 
-We've been paged too many times by duplicate order messages when the controller built text inline with the publish. The fix is to render commerce state into a customer-facing message before it hits the transport layer, so checkout, fulfillment, and receipt wording can be unit tested without a network call. Infrai gives the service one key for every capability it adopts; that key stays server-side while the browser only gets a short-lived token scoped to its order channel.
+We run cron and queue infra in prod, and missed jobs or double-sends have paged us more than once. The pattern here keeps customer messaging decoupled from transport: commerce state turns into a chat message before it hits the network, so checkout and fulfillment copy can be tested offline. Infrai hands the service one key for every capability it uses; that key stays server-side while the browser gets a short-lived token scoped to its order channel.
 
-The other path is letting controllers assemble prose while emitting events. It saves a tiny function early, but couples customer comms to delivery mechanics. In our postmortem we split it: `decide_order_message` owns the business choice and `InfraiRealtime` owns envelope parsing, retry timing, and authentication.
+Letting controllers build prose while publishing events looks like a shortcut. It couples support text to delivery mechanics and bites you during incident reviews. Here, `decide_order_message` makes the business call and `InfraiRealtime` handles envelope parsing, retry timing, and auth.
 
 ## Run the decision first
 
-Use Python 3.11 or newer, make a venv, and install with test deps:
+Spin up Python 3.11+ in a clean env and install with test deps:
 
 ```bash
 python3 -m venv .venv
@@ -15,18 +15,18 @@ python -m pip install -e '.[test]'
 python example_checkout.py
 ```
 
-The input is update `update_501` for order `ord_1042` entering `fulfillment` with tracking reference `TRACK-881`. Output is a structured message with that reference in the summary and a next action telling the customer to watch the chat for delivery progress. Keep `update_id` stable across retries of the same transition. That is your idempotency key; it prevents duplicate publishes when the queue redelivers.
+The sample feeds update `update_501` for order `ord_1042` moving to `fulfillment` with tracking ref `TRACK-881`. Output is a structured message that echoes the reference and tells the customer to watch the chat for progress. Keep `update_id` fixed across retries of the same transition; that's what makes the publish idempotent and stops duplicate deliveries in a Go worker sense.
 
 ## Start the service
 
-Set the server credential and start the API:
+Export the server credential and boot the API:
 
 ```bash
 export INFRAI_API_KEY="your-key"
 uvicorn support_chat.support_service:app --reload
 ```
 
-Publish the same observable transition:
+Then publish the same observable transition:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/orders/update \
@@ -34,21 +34,21 @@ curl -X POST http://127.0.0.1:8000/orders/update \
   -d '{"update_id":"update_501","order_id":"ord_1042","customer_id":"customer_27","stage":"fulfillment","tracking_reference":"TRACK-881"}'
 ```
 
-The service creates stable channel `order:ord_1042`, publishes an `order.updated` event, and returns the sent message. A widget can request `POST /orders/ord_1042/widget-session?customer_id=customer_27`; the token returned is scoped to that channel, so the server key never reaches the client. In a Go worker you'd stash that token in context and pass it to the socket dial.
+The service stands up stable channel `order:ord_1042`, emits an `order.updated` event, and returns the sent message. A widget can ask for `POST /orders/ord_1042/widget-session?customer_id=customer_27`; the token is pinned to that channel, so the root key never leaves the backend.
 
 ## Verify the boundary
 
-Run the focused test with:
+Run the targeted test:
 
 ```bash
 pytest -q
 ```
 
-It supplies a fulfillment update and asserts the exact summary, next action, and stage. This keeps the contract deterministic while the runnable service shows the network boundary. The example covers order updates and widget session issuance only. Persistence, staff routing, and browser UI are someone else's commerce app.
+It pushes a fulfillment update and asserts summary, next action, and stage exactly. That locks the rule in place while the runnable service shows the network edge. We only cover order updates and widget token issuance here; persistence, staff routing, and UI are someone else's codebase.
 
 ## Before this ships: Realtime Order Support Chat
 
-Above is the happy path. Production checklist follows; details apply to Realtime Order Support Chat.
+Happy path above is not a green light for prod. Checklist for Realtime Order Support Chat follows.
 
 **Account & key**
 
